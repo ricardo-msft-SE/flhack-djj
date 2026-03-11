@@ -4,6 +4,51 @@
 
 ---
 
+## Table of Contents
+
+- [Overview](#overview)
+  - [Choose your path](#choose-your-path)
+- [Architecture](#architecture)
+  - [Data Flow](#data-flow)
+- [What is Foundry IQ?](#what-is-foundry-iq)
+  - [What Foundry IQ does for this solution](#what-foundry-iq-does-for-this-solution)
+  - [Foundry IQ vs. custom ingestion pipeline](#foundry-iq-vs-custom-ingestion-pipeline)
+- [Prerequisites](#prerequisites)
+  - [MCP Servers (Programmatic path)](#mcp-servers-programmatic-path)
+- [Step 1 — Provision Infrastructure](#step-1--provision-infrastructure)
+  - [1.1 Authenticate](#11-authenticate)
+  - [1.2 Create a Resource Group](#12-create-a-resource-group)
+  - [1.3 Create an Azure AI Foundry Hub and Project](#13-create-an-azure-ai-foundry-hub-and-project)
+  - [1.4 Deploy an Azure OpenAI Model](#14-deploy-an-azure-openai-model)
+  - [1.5 Create Azure AI Search](#15-create-azure-ai-search)
+- [Step 2 — Ingest Policy Documents into the Knowledge Base](#step-2--ingest-policy-documents-into-the-knowledge-base)
+  - [2.1 PDF Ingestion via Foundry IQ](#21-pdf-ingestion-via-foundry-iq)
+    - [Option A — VS Code (Foundry Portal / AI Extension)](#option-a--vs-code-foundry-portal--ai-extension)
+    - [Option B — CLI / Python SDK](#option-b--cli--python-sdk)
+  - [2.2 Web Policy Data Ingestion](#22-web-policy-data-ingestion)
+- [Step 3 — Build the RAG Orchestration Flow](#step-3--build-the-rag-orchestration-flow)
+  - [3.1 Scaffold the Prompt Flow](#31-scaffold-the-prompt-flow)
+  - [3.2 Add the AOAI Connection](#32-add-the-aoai-connection)
+  - [3.3 Define the Flow DAG](#33-define-the-flow-dag)
+  - [3.4 Retrieval Node](#34-retrieval-node)
+  - [3.5 Answer Generation Prompt](#35-answer-generation-prompt)
+- [Step 4 — Run and Test Locally](#step-4--run-and-test-locally)
+- [Step 5 — Deploy to Azure AI Foundry](#step-5--deploy-to-azure-ai-foundry)
+  - [5.1 Build a Deployable Artifact](#51-build-a-deployable-artifact)
+  - [5.2 Create a Managed Online Endpoint](#52-create-a-managed-online-endpoint)
+  - [5.3 Deploy](#53-deploy)
+  - [5.4 Smoke Test](#54-smoke-test)
+- [Day-2 Operations — Programmatic Reference](#day-2-operations--programmatic-reference)
+  - [Update the system prompt without redeploying](#update-the-system-prompt-without-redeploying)
+  - [Re-index after new PDFs are added](#re-index-after-new-pdfs-are-added)
+  - [Verify ingestion with a spot-check query](#verify-ingestion-with-a-spot-check-query)
+  - [Scale the endpoint](#scale-the-endpoint)
+- [Security Checklist](#security-checklist)
+- [Repository Structure](#repository-structure)
+- [Key References](#key-references)
+
+---
+
 ## Overview
 
 This guide explains how to implement the RAG architecture sketched below using **Azure AI Foundry**, **VS Code**, and Azure CLIs. The system lets users query 30+ organizational policy PDFs and web-sourced policy data through a chat interface backed by Azure OpenAI (AOAI) and Azure AI Search.
