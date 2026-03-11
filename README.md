@@ -29,15 +29,47 @@ Each step offers two tracks — pick the one that fits your workflow:
 |---|---|---|
 | **LLM** | GPT model hosted at NWRDC | Azure OpenAI (AOAI) |
 | **Retrieval** | Semantic + vector search | Azure AI Search |
-| **Knowledge Base** | Chunked, vectorized policy content | AI Search Index |
-| **Ingestion — PDFs** | 30+ policy & procedure documents | Azure AI Foundry Data Ingestion |
-| **Ingestion — Web** | Live web policy pages | Custom crawler → AI Search indexer |
+| **Knowledge Base** | Chunked, vectorized policy content | AI Search Index (populated by **Foundry IQ**) |
+| **Ingestion — PDFs** | 30+ policy & procedure documents | **Azure AI Foundry IQ** (document ingestion pipeline) |
+| **Ingestion — Web** | Live web policy pages | Foundry IQ web data source → AI Search indexer |
 | **Orchestration** | Flow connecting retrieval → generation | Azure AI Foundry Prompt Flow |
 | **Auth** | Secretless service-to-service | Managed Identity / DefaultAzureCredential |
 
 ### Data Flow
 
 ![RAG Data Flow Architecture](./assets/arch1.png)
+
+---
+
+## What is Foundry IQ?
+
+**Azure AI Foundry IQ** is the built-in knowledge management layer of Azure AI Foundry. Rather than building a bespoke ingestion pipeline (chunking libraries, embedding calls, index schema management), Foundry IQ provides a managed, end-to-end pathway from raw documents to a query-ready vector index — all configured through the Foundry portal, CLI, or REST API.
+
+### What Foundry IQ does for this solution
+
+| Capability | How it maps to this RAG system |
+|---|---|
+| **Document storage** | Stores uploaded PDFs in the Foundry project's backing Azure Blob Storage container, versioned as a **Data Asset** |
+| **Document cracking** | Extracts text from PDFs (including scanned pages via Azure Document Intelligence under the hood) |
+| **Chunking** | Splits extracted text into overlapping chunks (configurable size and overlap) |
+| **Vectorization** | Calls your AOAI embedding deployment (`text-embedding-3-large`) to generate dense vectors for each chunk |
+| **Index management** | Creates and maintains the AI Search index schema, field mappings, and HNSW vector profile automatically |
+| **Incremental refresh** | Re-processes only new or changed files when the data asset is updated — no full re-index needed |
+| **Scheduling** | Runs ingestion on a cron schedule or on-demand trigger — no orchestration code required |
+
+### Foundry IQ vs. custom ingestion pipeline
+
+| Consideration | Foundry IQ | Custom Python pipeline |
+|---|---|---|
+| Setup time | Minutes (portal or one CLI job) | Hours (schema design, SDK code, error handling) |
+| PDF text extraction | Built-in (Document Intelligence) | Requires `pdfplumber` / `pypdf` + scanned-page handling |
+| Embedding calls | Managed, retried automatically | Must implement retry / throttle logic |
+| Index schema | Auto-generated and versioned | Manually defined |
+| Incremental updates | Built-in delta detection | Custom logic required |
+| Custom field metadata | Limited to standard fields | Full control |
+| Air-gapped / custom networking | Follows Foundry hub network config | Fully customisable |
+
+> **Recommended starting point:** Use Foundry IQ for the PDF ingestion path. Switch to the custom SDK pipeline only if you need non-standard chunking strategies, custom metadata fields, or preprocessing (PII redaction, table extraction) before vectorization.
 
 ---
 
@@ -205,12 +237,12 @@ az search service create \
 
 ## Step 2 — Ingest Policy Documents into the Knowledge Base
 
-> **⚡ Programmatic path — use Foundry's built-in ingestion pipeline**
+> **⚡ Programmatic path — Foundry IQ handles everything**
 >
-> Azure AI Foundry ships a managed **data ingestion + vectorization** pipeline. Point it at your files; it handles chunking, embedding, and index population with zero Python.
+> Foundry IQ's managed ingestion pipeline cracks PDFs, chunks them, vectorizes via your AOAI embedding deployment, and populates the AI Search index. The only thing you supply is the files and three config values.
 >
 > ```bash
-> # 1. Register your PDF folder as a Foundry data asset
+> # 1. Register your PDF folder as a versioned Foundry Data Asset
 > az ml data create \
 >   --name policy-pdfs \
 >   --path ./policies/ \
@@ -218,7 +250,7 @@ az search service create \
 >   --resource-group rg-rag-policy \
 >   --workspace-name aip-rag-policy
 >
-> # 2. Kick off the built-in vectorization pipeline
+> # 2. Run the Foundry IQ ingestion pipeline (crack → chunk → embed → index)
 > az ml job create \
 >   --file - <<'EOF'
 > $schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
@@ -227,34 +259,53 @@ az search service create \
 > settings:
 >   default_compute: serverless
 > jobs:
->   ingest:
+>   crack_and_chunk:
 >     type: command
 >     component: azureml://registries/azureml/components/llm_rag_crack_and_chunk_and_embed/versions/latest
 >     inputs:
 >       input_data:
 >         type: uri_folder
 >         path: azureml:policy-pdfs@latest
+>       # Foundry IQ calls Document Intelligence for scanned PDFs automatically
+>       use_layout: "true"
 >       embeddings_model: azure_open_ai://deployment/text-embedding-3-large/model/text-embedding-3-large
 >       asset_uri: azureml://datastores/workspaceblobstore/paths/policy-chunks
 >       chunk_size: "1024"
 >       chunk_overlap: "256"
->   index_and_register:
+>   update_index:
 >     type: command
 >     component: azureml://registries/azureml/components/llm_rag_update_acs_index/versions/latest
 >     inputs:
->       embeddings: ${{parent.jobs.ingest.outputs.embeddings}}
+>       embeddings: ${{parent.jobs.crack_and_chunk.outputs.embeddings}}
 >       acs_config:
 >         endpoint: https://srch-rag-policy.search.windows.net
 >         index_name: policy-index
 > EOF
-> ```
 >
-> Monitor progress:
->
-> ```bash
+> # 3. Monitor — Foundry IQ processes only new/changed files on subsequent runs
 > az ml job show --name <job-name> \
 >   --resource-group rg-rag-policy \
->   --workspace-name aip-rag-policy
+>   --workspace-name aip-rag-policy \
+>   --query "{status:status, startTime:startTimeUtc, endTime:endTimeUtc}"
+> ```
+>
+> **Schedule recurring re-indexing** (e.g. nightly, when new policies are published):
+>
+> ```bash
+> az ml schedule create \
+>   --file - <<'EOF'
+> name: nightly-policy-reindex
+> trigger:
+>   type: recurrence
+>   frequency: day
+>   interval: 1
+>   start_time: "2026-01-01T02:00:00"
+>   time_zone: America/New_York
+> create_job:
+>   type: pipeline
+>   experiment_name: policy-ingestion
+>   job: ./ingestion-pipeline.yaml
+> EOF
 > ```
 >
 > **Via Copilot + MCP:** *"Create an AI Search index named policy-index on srch-rag-policy with a content field and a 3072-dimension vector field using hnsw"* — the Azure AI Search MCP issues the index-creation REST call for you.
@@ -263,17 +314,30 @@ az search service create \
 
 The steps below describe the **SDK / code track** for full control over chunking strategy, filtering, and custom field schemas.
 
-### 2.1 PDF Ingestion
+### 2.1 PDF Ingestion via Foundry IQ
 
 #### Option A — VS Code (Foundry Portal / AI Extension)
 
-1. Open the **Azure AI Foundry** extension in VS Code.
-2. Connect to the project `aip-rag-policy`.
-3. Navigate to **Data** → **Add a data source** → **Upload files**.
-4. Upload your PDF files from the `./policies/` directory.
-5. Configure chunking: size = `1024` tokens, overlap = `256`.
-6. Select **Azure AI Search** as the target, create index `policy-index`.
-7. Choose `text-embedding-3-large` as the embedding model.
+Foundry IQ surfaces in the Foundry portal as the **"Add your data"** wizard, and in VS Code via the **Azure AI Foundry** extension.
+
+**In VS Code:**
+
+1. Open the **Azure AI Foundry** extension and connect to `aip-rag-policy`.
+2. Navigate to **Knowledge bases** → **New knowledge base**.
+3. Choose **Files / Folders** as the data source type.
+4. Upload your PDF files from `./policies/` — Foundry IQ stores them in the project's backing blob container and versions them as a Data Asset.
+5. Set chunking: **size = 1024 tokens**, **overlap = 256 tokens**.
+6. Select embedding model: `text-embedding-3-large` (your AOAI deployment).
+7. Target index: create new → `policy-index` on `srch-rag-policy`.
+8. Click **Create** — Foundry IQ runs the crack → chunk → embed → index pipeline and reports progress inline.
+
+**To add web policy sources:**
+
+1. In the same **Knowledge bases** panel, select the new knowledge base.
+2. **Add data source** → choose **Web URLs**.
+3. Paste the policy page URLs — Foundry IQ crawls and periodically re-indexes them into the same `policy-index`.
+
+> The knowledge base created here is directly referenceable by name in Prompt Flow and Foundry Agent Service — no connection string required when running inside the same Foundry project.
 
 #### Option B — CLI / Python SDK
 
@@ -765,17 +829,29 @@ Or in Copilot Agent Mode: *"Update the system prompt in generate_answer.jinja2 t
 
 ### Re-index after new PDFs are added
 
+Foundry IQ tracks data asset versions and processes only new or modified files on subsequent runs (delta ingestion). You don't need to re-upload unchanged PDFs.
+
 ```bash
 # Upload new files to the Foundry data asset blob location
 az storage blob upload-batch \
   --source ./policies/new/ \
   --destination "<blob-container-url>"
 
-# Resubmit the ingestion pipeline (picks up new files automatically)
+# Create a new version of the data asset (Foundry IQ uses the latest version)
+az ml data create \
+  --name policy-pdfs \
+  --path ./policies/ \
+  --type uri_folder \
+  --resource-group rg-rag-policy \
+  --workspace-name aip-rag-policy
+
+# Resubmit the Foundry IQ ingestion pipeline (only new/changed files are processed)
 az ml job create --file ingestion-pipeline.yaml \
   --resource-group rg-rag-policy \
   --workspace-name aip-rag-policy
 ```
+
+If you set up a **schedule** in Step 2, new files placed in the blob container before the next scheduled run are picked up automatically with no manual trigger.
 
 ### Verify ingestion with a spot-check query
 
