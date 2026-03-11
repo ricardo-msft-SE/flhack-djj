@@ -8,6 +8,17 @@
 
 This guide explains how to implement the RAG architecture sketched below using **Azure AI Foundry**, **VS Code**, and Azure CLIs. The system lets users query 30+ organizational policy PDFs and web-sourced policy data through a chat interface backed by Azure OpenAI (AOAI) and Azure AI Search.
 
+### Choose your path
+
+Each step offers two tracks — pick the one that fits your workflow:
+
+| Track | Who it's for | What you write |
+|---|---|---|
+| **⚡ Programmatic** | Config-only, minimal scripting | CLI one-liners, `azd` templates, MCP prompts |
+| **🔧 SDK / Code** | Full control, custom logic | Python SDK, YAML DAGs, Jinja2 prompts |
+
+> **TL;DR for the programmatic path:** `azd init --template` → `azd up` → Foundry built-in ingestion pipeline → GitHub Copilot + MCP for day-2 ops. No custom Python required.
+
 ![RAG Architecture](./assets/architecture-sketch.jpg)
 
 ---
@@ -77,9 +88,61 @@ code --install-extension ms-python.python
 code --install-extension ms-azuretools.vscode-azurefunctions
 ```
 
+### MCP Servers (Programmatic path)
+
+For the config-only track, install the Azure MCP server so GitHub Copilot Agent Mode can provision and query resources on your behalf without you writing any SDK code.
+
+```bash
+# Install the Azure MCP server globally
+npx @azure/mcp@latest server install
+
+# Verify the server is registered
+npx @azure/mcp@latest server list
+```
+
+After installation, open VS Code, switch Copilot to **Agent Mode**, and you can issue natural-language commands like:
+
+> *"Create an Azure AI Search service named srch-rag-policy in resource group rg-rag-policy, Standard tier, East US"*
+
+The MCP server translates the prompt to the correct `az` REST calls and executes them. The sub-sections below show the equivalent explicit commands for auditability.
+
+**Useful MCP toolsets for this solution:**
+
+| MCP server | Covers |
+|---|---|
+| `@azure/mcp` (Azure core) | Resource groups, RBAC, subscriptions |
+| Azure AI Foundry MCP | Hub/project creation, model deployments, online endpoints |
+| Azure AI Search MCP | Index creation, indexer management, datasource registration |
+
 ---
 
 ## Step 1 — Provision Infrastructure
+
+> **⚡ Programmatic path — provision everything in two commands**
+>
+> Use the official `azd` RAG template. It creates the resource group, Foundry hub + project, AOAI deployments, AI Search service, and wires up managed identity — no manual `az` commands needed.
+>
+> ```bash
+> # Authenticate
+> az login
+> azd auth login
+>
+> # Initialise from the community RAG template
+> mkdir rag-policy && cd rag-policy
+> azd init --template azure-samples/azure-openai-rag-workshop
+>
+> # Provision all resources in one shot (prompts for subscription / location)
+> azd up
+> ```
+>
+> Skip to [Step 2](#step-2--ingest-policy-documents-into-the-knowledge-base) after `azd up` succeeds. The template outputs all endpoint URLs as environment variables you can reference directly.
+>
+> **Day-2 changes via MCP (no portal, no extra commands):**
+> Open Copilot Agent Mode and say: *"Scale my AI Search service srch-rag-policy to 2 replicas"* — the Azure MCP server handles the REST call.
+
+---
+
+The steps below describe the **equivalent explicit CLI commands** for environments where the template cannot be used (air-gapped, custom naming, partial adoption).
 
 ### 1.1 Authenticate
 
@@ -169,6 +232,64 @@ az search service create \
 ---
 
 ## Step 2 — Ingest Policy Documents into the Knowledge Base
+
+> **⚡ Programmatic path — use Foundry's built-in ingestion pipeline**
+>
+> Azure AI Foundry ships a managed **data ingestion + vectorization** pipeline. Point it at your files; it handles chunking, embedding, and index population with zero Python.
+>
+> ```bash
+> # 1. Register your PDF folder as a Foundry data asset
+> az ml data create \
+>   --name policy-pdfs \
+>   --path ./policies/ \
+>   --type uri_folder \
+>   --resource-group rg-rag-policy \
+>   --workspace-name aip-rag-policy
+>
+> # 2. Kick off the built-in vectorization pipeline
+> az ml job create \
+>   --file - <<'EOF'
+> $schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
+> type: pipeline
+> experiment_name: policy-ingestion
+> settings:
+>   default_compute: serverless
+> jobs:
+>   ingest:
+>     type: command
+>     component: azureml://registries/azureml/components/llm_rag_crack_and_chunk_and_embed/versions/latest
+>     inputs:
+>       input_data:
+>         type: uri_folder
+>         path: azureml:policy-pdfs@latest
+>       embeddings_model: azure_open_ai://deployment/text-embedding-3-large/model/text-embedding-3-large
+>       asset_uri: azureml://datastores/workspaceblobstore/paths/policy-chunks
+>       chunk_size: "1024"
+>       chunk_overlap: "256"
+>   index_and_register:
+>     type: command
+>     component: azureml://registries/azureml/components/llm_rag_update_acs_index/versions/latest
+>     inputs:
+>       embeddings: ${{parent.jobs.ingest.outputs.embeddings}}
+>       acs_config:
+>         endpoint: https://srch-rag-policy.search.windows.net
+>         index_name: policy-index
+> EOF
+> ```
+>
+> Monitor progress:
+>
+> ```bash
+> az ml job show --name <job-name> \
+>   --resource-group rg-rag-policy \
+>   --workspace-name aip-rag-policy
+> ```
+>
+> **Via Copilot + MCP:** *"Create an AI Search index named policy-index on srch-rag-policy with a content field and a 3072-dimension vector field using hnsw"* — the Azure AI Search MCP issues the index-creation REST call for you.
+
+---
+
+The steps below describe the **SDK / code track** for full control over chunking strategy, filtering, and custom field schemas.
 
 ### 2.1 PDF Ingestion
 
@@ -305,6 +426,40 @@ SEARCH_ADMIN_KEY=$(az search admin-key show \
 ---
 
 ## Step 3 — Build the RAG Orchestration Flow
+
+> **⚡ Programmatic path — clone a pre-built RAG flow template**
+>
+> Microsoft publishes a battle-tested RAG Prompt Flow template in the `azureml` registry. Import it directly — no DAG authoring, no Python retrieval node to write.
+>
+> ```bash
+> # Pull the community RAG flow from the registry
+> pfcli flow clone \
+>   --source azureml://registries/azureml/models/rag-flow-template/versions/latest \
+>   --output rag-policy-flow
+>
+> cd rag-policy-flow
+>
+> # Wire up your endpoints via environment variables (no secret storage)
+> cat > .env <<'EOF'
+> AZURE_OPENAI_ENDPOINT=https://aoai-rag-policy.openai.azure.com
+> AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-policy-chat
+> AZURE_OPENAI_EMBED_DEPLOYMENT=text-embedding-3-large
+> AZURE_SEARCH_ENDPOINT=https://srch-rag-policy.search.windows.net
+> AZURE_SEARCH_INDEX=policy-index
+> EOF
+>
+> # Test immediately — no code changes required for the basic RAG pattern
+> pfcli flow test --flow . \
+>   --input question="What is the user account deletion policy?"
+> ```
+>
+> **Customise prompts without touching code:** Open the flow in VS Code with the **Prompt Flow** extension, click the `generate_answer` node, and edit the system prompt inline in the visual editor. Changes are saved back to the YAML.
+>
+> **Via Copilot + MCP:** In Agent Mode say: *"Add a filter to my Prompt Flow's retrieve_context node that keeps only chunks where sourcefile contains 'HR'"* — Copilot reads your `flow.dag.yaml`, generates the diff, and applies it.
+
+---
+
+The steps below describe the **manual DAG definition** for teams that need custom retrieval logic.
 
 ### 3.1 Scaffold the Prompt Flow
 
@@ -449,6 +604,36 @@ user:
 
 ## Step 4 — Run and Test Locally
 
+> **⚡ Programmatic path — test and evaluate with pure CLI, no test harness code**
+>
+> ```bash
+> # Single-turn interactive test
+> pfcli flow test --flow rag-policy-flow \
+>   --input question="What is the process for user account deletion?"
+>
+> # Batch eval — streams per-row results to stdout
+> pfcli run create \
+>   --flow rag-policy-flow \
+>   --data tests/eval_questions.jsonl \
+>   --column-mapping question='${data.question}' \
+>   --stream
+>
+> # Attach a built-in groundedness evaluator (no custom eval code needed)
+> pfcli run create \
+>   --flow azureml://registries/azureml/models/gpt-groundedness/versions/latest \
+>   --data tests/eval_questions.jsonl \
+>   --run <previous-run-id> \
+>   --column-mapping question='${data.question}' answer='${run.outputs.answer}'
+> ```
+>
+> **Generate a starter eval dataset via Copilot Chat (no scripting):**
+> Paste this into Copilot Chat and save the output to `tests/eval_questions.jsonl`:
+> > *"Generate 10 Q&A pairs in JSONL format (`question`, `ground_truth` fields) covering HR policy topics: account deletion, PTO, data retention, acceptable use."*
+>
+> **VS Code shortcut:** Install the **Prompt Flow** extension → right-click any node → **Run from here** to replay a single step with cached upstream outputs.
+
+Standard commands for reference:
+
 ```bash
 # Interactive single-turn test
 pfcli flow test --flow . \
@@ -467,6 +652,60 @@ In VS Code, open the flow with the **Prompt Flow** panel to trace each node, ins
 ---
 
 ## Step 5 — Deploy to Azure AI Foundry
+
+> **⚡ Programmatic path — `azd deploy` or single `az ml` sequence**
+>
+> If you used the `azd` template in Step 1, deployment is one command after any flow or config change:
+>
+> ```bash
+> azd deploy
+> ```
+>
+> `azd` reads your `azure.yaml`, builds the container, pushes to Azure Container Registry, creates/updates the managed online endpoint, and shifts traffic — all automatically.
+>
+> For environments not using the `azd` template:
+>
+> ```bash
+> az ml online-endpoint create \
+>   --name rag-policy-endpoint \
+>   --resource-group rg-rag-policy \
+>   --workspace-name aip-rag-policy
+>
+> az ml online-deployment create \
+>   --file deployment.yaml \
+>   --resource-group rg-rag-policy \
+>   --workspace-name aip-rag-policy \
+>   --all-traffic
+> ```
+>
+> **Canary / blue-green via CLI (no portal):**
+>
+> ```bash
+> # Deploy v2 with 10 % traffic
+> az ml online-deployment create \
+>   --file deployment-v2.yaml \
+>   --resource-group rg-rag-policy \
+>   --workspace-name aip-rag-policy
+>
+> az ml online-endpoint update \
+>   --name rag-policy-endpoint \
+>   --traffic "rag-policy-deployment=90 rag-policy-deployment-v2=10" \
+>   --resource-group rg-rag-policy \
+>   --workspace-name aip-rag-policy
+>
+> # Promote v2 to 100 % after validation
+> az ml online-endpoint update \
+>   --name rag-policy-endpoint \
+>   --traffic "rag-policy-deployment-v2=100" \
+>   --resource-group rg-rag-policy \
+>   --workspace-name aip-rag-policy
+> ```
+>
+> **Via Copilot + MCP:** *"Deploy my Prompt Flow in rag-policy-flow to the rag-policy-endpoint endpoint in my aip-rag-policy Foundry project"* — the Foundry MCP server handles the REST calls.
+
+---
+
+The steps below describe the explicit artifact-build + deploy sequence for full control.
 
 ### 5.1 Build a Deployable Artifact
 
@@ -532,6 +771,67 @@ az ml online-endpoint invoke \
 {
   "question": "What is the process for user account deletion?"
 }
+```
+
+---
+
+---
+
+## Day-2 Operations — Programmatic Reference
+
+Common operational tasks expressible as single CLI commands or MCP prompts. No portal, no custom scripts.
+
+### Update the system prompt without redeploying
+
+```bash
+# Edit generate_answer.jinja2 locally, validate, then push
+pfcli flow test --flow rag-policy-flow   # confirm locally
+azd deploy                               # push updated flow artifact
+```
+
+Or in Copilot Agent Mode: *"Update the system prompt in generate_answer.jinja2 to also cite the section number of the policy, then redeploy"*
+
+### Re-index after new PDFs are added
+
+```bash
+# Upload new files to the Foundry data asset blob location
+az storage blob upload-batch \
+  --source ./policies/new/ \
+  --destination "<blob-container-url>"
+
+# Resubmit the ingestion pipeline (picks up new files automatically)
+az ml job create --file ingestion-pipeline.yaml \
+  --resource-group rg-rag-policy \
+  --workspace-name aip-rag-policy
+```
+
+### Verify ingestion with a spot-check query
+
+```bash
+SEARCH_KEY=$(az search query-key list \
+  --resource-group rg-rag-policy \
+  --service-name srch-rag-policy \
+  --query "[0].key" -o tsv)
+
+curl -s -X POST \
+  "https://srch-rag-policy.search.windows.net/indexes/policy-index/docs/search?api-version=2024-07-01" \
+  -H "Content-Type: application/json" \
+  -H "api-key: $SEARCH_KEY" \
+  -d '{"search": "account deletion", "top": 3, "select": "sourcefile,content"}' \
+  | jq '.value[] | .sourcefile'
+```
+
+> Use a **query key** (read-only) rather than the admin key for spot-checks and application use.
+
+### Scale the endpoint
+
+```bash
+az ml online-deployment update \
+  --name rag-policy-deployment \
+  --endpoint-name rag-policy-endpoint \
+  --instance-count 3 \
+  --resource-group rg-rag-policy \
+  --workspace-name aip-rag-policy
 ```
 
 ---
